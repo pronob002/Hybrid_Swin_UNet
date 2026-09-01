@@ -5,11 +5,10 @@ Fault-Tolerant Few-Shot Cross-Domain Adaptation & Benchmark Evaluation Pipeline.
 
 Key Features:
 1. Automated Per-Epoch Checkpointing (checkpoint_latest.pth & checkpoint_best.pth).
-2. Hugging Face Hub Auto-Sync: Automatically pushes checkpoints & result CSVs to your
-   Hugging Face repository. When a free-tier Colab/Kaggle session terminates and restarts,
-   it pulls the latest weights and resumes seamlessly!
-3. Persistent Result Caching: Automatically logs completed runs to benchmark_summary.json
-   and benchmark_summary.csv to prevent redundant computations across multi-regime loops.
+2. Comprehensive Downstream Artifacts: Saves benchmark_summary.csv, benchmark_summary.json,
+   per_case_details.json (for Wilcoxon p-value statistical tests), and training_curves.json.
+3. Hugging Face Hub Auto-Sync: Automatically pushes all checkpoints & result artifacts to
+   your private Hugging Face repository for seamless multi-session resume and analysis.
 """
 
 import os
@@ -180,7 +179,6 @@ def load_checkpoint_if_exists(
             local_target_path=latest_path,
             token=hf_token
         )
-        # Also pull best checkpoint if available
         best_path = os.path.join(checkpoint_dir, "checkpoint_best.pth")
         pull_file_from_hf(
             repo_id=hf_repo,
@@ -304,10 +302,16 @@ def evaluate_target_domain(
     val_loader: DataLoader,
     device: str = "cpu",
     max_cases: Optional[int] = None
-) -> Dict[str, Dict[str, float]]:
+) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, Dict[str, float]]]]:
+    """
+    Evaluates on unseen BTCV cases. Returns:
+    1. Summary dictionary across all cases (Mean/Std DSC, Mean HD95, Mean ASD per organ).
+    2. Detailed per-case dictionary for statistical significance testing (Wilcoxon signed-rank).
+    """
     model.eval()
     all_organ_metrics = {name: {"DSC": [], "HD95": [], "ASD": []} for name in list(UNIFIED_ORGAN_NAMES.values())[1:]}
-    
+    per_case_details: Dict[str, Dict[str, Dict[str, float]]] = {}
+
     print("\n--- Evaluating on BTCV Target Domain ---")
     case_count = 0
     with torch.no_grad():
@@ -320,6 +324,8 @@ def evaluate_target_domain(
             preds = torch.argmax(logits, dim=1)[0].cpu().numpy()
 
             case_res = evaluate_case(preds, label, num_classes=14)
+            per_case_details[case_id] = case_res
+
             for organ, vals in case_res.items():
                 all_organ_metrics[organ]["DSC"].append(vals["DSC (%)"])
                 all_organ_metrics[organ]["HD95"].append(vals["HD95 (mm)"])
@@ -338,7 +344,7 @@ def evaluate_target_domain(
             "Mean HD95 (mm)": float(np.mean(vals["HD95"])),
             "Mean ASD (mm)": float(np.mean(vals["ASD"]))
         }
-    return summary
+    return summary, per_case_details
 
 
 def update_results_cache(
@@ -352,7 +358,10 @@ def update_results_cache(
     os.makedirs(results_dir, exist_ok=True)
     json_path = os.path.join(results_dir, "benchmark_summary.json")
     csv_path = os.path.join(results_dir, "benchmark_summary.csv")
+    per_case_path = os.path.join(results_dir, "per_case_details.json")
+    training_curves_path = os.path.join(results_dir, "training_curves.json")
 
+    # 1. Update benchmark_summary.json
     cached = {}
     if os.path.isfile(json_path):
         try:
@@ -360,12 +369,11 @@ def update_results_cache(
                 cached = json.load(f)
         except Exception:
             cached = {}
-
     cached[exp_key] = exp_data
     with open(json_path, "w") as f:
         json.dump(cached, f, indent=2)
 
-    # Export CSV representation
+    # 2. Update benchmark_summary.csv
     fieldnames = [
         "Experiment_Key", "Model", "Shots", "Seed", "Epochs",
         "Mean_DSC", "Mean_HD95", "Mean_ASD"
@@ -393,12 +401,38 @@ def update_results_cache(
         writer.writeheader()
         writer.writerows(rows)
 
-    print(f"\n>>> [SAVED] Benchmark results cached to {json_path} & {csv_path}")
+    # 3. Update per_case_details.json (for Wilcoxon statistical testing)
+    cached_cases = {}
+    if os.path.isfile(per_case_path):
+        try:
+            with open(per_case_path, "r") as f:
+                cached_cases = json.load(f)
+        except Exception:
+            cached_cases = {}
+    cached_cases[exp_key] = exp_data.get("per_case_details", {})
+    with open(per_case_path, "w") as f:
+        json.dump(cached_cases, f, indent=2)
+
+    # 4. Update training_curves.json (for convergence figures)
+    cached_curves = {}
+    if os.path.isfile(training_curves_path):
+        try:
+            with open(training_curves_path, "r") as f:
+                cached_curves = json.load(f)
+        except Exception:
+            cached_curves = {}
+    cached_curves[exp_key] = exp_data.get("loss_history", [])
+    with open(training_curves_path, "w") as f:
+        json.dump(cached_curves, f, indent=2)
+
+    print(f"\n>>> [SAVED] Benchmark artifacts cached to {results_dir}/ (summary JSON, CSV, per-case details, loss curves)")
 
     # Push updated results to Hugging Face Hub
     if hf_api and hf_repo:
         push_file_to_hf(hf_api, hf_repo, local_path=json_path, path_in_repo="results/benchmark_summary.json", token=hf_token)
         push_file_to_hf(hf_api, hf_repo, local_path=csv_path, path_in_repo="results/benchmark_summary.csv", token=hf_token)
+        push_file_to_hf(hf_api, hf_repo, local_path=per_case_path, path_in_repo="results/per_case_details.json", token=hf_token)
+        push_file_to_hf(hf_api, hf_repo, local_path=training_curves_path, path_in_repo="results/training_curves.json", token=hf_token)
 
 
 def is_experiment_already_done(
@@ -483,7 +517,7 @@ def run_experiment(
         raise ValueError(f"Unknown model_type: {model_type}")
 
     # Train with auto-checkpointing, auto-resume, and Hugging Face Hub cloud sync
-    train_fewshot_adaptation(
+    loss_history = train_fewshot_adaptation(
         model,
         support_loader,
         num_epochs=num_epochs,
@@ -496,7 +530,7 @@ def run_experiment(
     )
 
     # Evaluate
-    results = evaluate_target_domain(model, target_loader, device=device, max_cases=eval_cases)
+    results, per_case_details = evaluate_target_domain(model, target_loader, device=device, max_cases=eval_cases)
 
     mean_all_dsc = [m["Mean DSC (%)"] for m in results.values()]
     mean_all_hd = [m["Mean HD95 (mm)"] for m in results.values()]
@@ -527,7 +561,9 @@ def run_experiment(
         "overall_mean_dsc": overall_dsc,
         "overall_mean_hd95": overall_hd,
         "overall_mean_asd": overall_asd,
-        "per_organ": results
+        "per_organ": results,
+        "per_case_details": per_case_details,
+        "loss_history": loss_history
     }
 
     update_results_cache(
@@ -551,7 +587,7 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
     parser.add_argument("--results_dir", type=str, default="results")
     parser.add_argument("--hf_repo", type=str, default=None,
-                        help="Hugging Face Model Repo ID (e.g. 'username/hybrid-swin-unet-checkpoints')")
+                        help="Hugging Face Model Repo ID (e.g. 'Pronob002/hybrid-swin-unet-checkpoints')")
     parser.add_argument("--hf_token", type=str, default=None,
                         help="Hugging Face Access Token (or set HF_TOKEN env var)")
     parser.add_argument("--force_rerun", action="store_true")
