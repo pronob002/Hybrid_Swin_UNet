@@ -57,7 +57,7 @@ def init_hf_sync(repo_id: Optional[str], token: Optional[str] = None) -> Optiona
         return None
     token = token or os.environ.get("HF_TOKEN")
     if not token:
-        print("⚠️ [HF-SYNC] Warning: Hugging Face repo specified but no HF_TOKEN found. Cloud upload disabled.")
+        print("[WARNING] [HF-SYNC] Hugging Face repo specified but no HF_TOKEN found. Cloud upload disabled.")
         return None
 
     try:
@@ -66,7 +66,7 @@ def init_hf_sync(repo_id: Optional[str], token: Optional[str] = None) -> Optiona
         print(f">>> [HF-SYNC] Cloud repository ready: https://huggingface.co/{repo_id} (Private)")
         return api
     except Exception as e:
-        print(f"⚠️ [HF-SYNC] Failed to initialize HF repo '{repo_id}': {e}")
+        print(f"[WARNING] [HF-SYNC] Failed to initialize HF repo '{repo_id}': {e}")
         return None
 
 
@@ -117,7 +117,7 @@ def push_file_to_hf(
         )
         print(f">>> [HF-SYNC] Uploaded '{path_in_repo}' to Hugging Face Hub.")
     except Exception as e:
-        print(f"⚠️ [HF-SYNC] Upload failed for '{path_in_repo}': {e}")
+        print(f"[WARNING] [HF-SYNC] Upload failed for '{path_in_repo}': {e}")
 
 
 # ==============================================================================

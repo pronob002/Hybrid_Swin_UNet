@@ -170,7 +170,7 @@ def main():
     curves = load_json("results/training_curves.json")
 
     if not summary:
-        print("⚠️ No benchmark_summary.json found in results/ yet. Please run train.py or colab benchmark first.")
+        print("[WARNING] No benchmark_summary.json found in results/ yet. Please run train.py or colab benchmark first.")
         return
 
     generate_cbm_tables(summary, per_case)
