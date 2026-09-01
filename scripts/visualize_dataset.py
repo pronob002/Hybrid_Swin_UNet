@@ -55,13 +55,13 @@ CMAP_ORGAN = ListedColormap(ORGAN_COLORS)
 def download_case(case_id: str = "amos_0048", dataset_type: str = "amos") -> Tuple[str, str]:
     """Downloads a raw CT scan and label from Hugging Face."""
     if dataset_type == "amos":
-        repo_id = "raghuram-k/amos_dataset"
+        repo_id = "MedOtter/amos22-ct-dataset"
         img_subpath = f"train/imagesTr/{case_id}.nii.gz"
         lbl_subpath = f"train/labelsTr/{case_id}.nii.gz"
     else:
-        repo_id = "raghuram-k/btcv_dataset"
-        img_subpath = f"imagesTs/{case_id}.nii.gz"
-        lbl_subpath = f"labelsTs/{case_id}.nii.gz"
+        repo_id = "Live12/btcv"
+        img_subpath = f"RawData/Training/img/{case_id}.nii.gz"
+        lbl_subpath = f"RawData/Training/label/label{case_id[3:]}.nii.gz"
 
     print(f"\n>>> [HF-HUB] Downloading {dataset_type.upper()} case: '{case_id}' from {repo_id}...")
     img_path = hf_hub_download(repo_id=repo_id, filename=img_subpath, repo_type="dataset")
