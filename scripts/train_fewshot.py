@@ -5,8 +5,9 @@ Fault-Tolerant Few-Shot Cross-Domain Adaptation & Benchmark Evaluation Pipeline.
 
 Key Features:
 1. Automated Per-Epoch Checkpointing (checkpoint_latest.pth & checkpoint_best.pth).
-2. Auto-Resume Logic: If a session disconnects or times out in Colab/Kaggle free tier,
-   rerunning resumes seamlessly from the exact last epoch without losing progress.
+2. Hugging Face Hub Auto-Sync: Automatically pushes checkpoints & result CSVs to your
+   Hugging Face repository. When a free-tier Colab/Kaggle session terminates and restarts,
+   it pulls the latest weights and resumes seamlessly!
 3. Persistent Result Caching: Automatically logs completed runs to benchmark_summary.json
    and benchmark_summary.csv to prevent redundant computations across multi-regime loops.
 """
@@ -22,6 +23,7 @@ from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from huggingface_hub import HfApi, hf_hub_download, create_repo
 
 # Add project root to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -42,6 +44,83 @@ def set_seed(seed: int = 42):
         torch.cuda.manual_seed_all(seed)
 
 
+# ==============================================================================
+# Hugging Face Hub Cloud Storage & Sync Utilities
+# ==============================================================================
+
+def init_hf_sync(repo_id: Optional[str], token: Optional[str] = None) -> Optional[HfApi]:
+    """Initializes and creates the remote Hugging Face repository if not existing."""
+    if not repo_id:
+        return None
+    token = token or os.environ.get("HF_TOKEN")
+    if not token:
+        print("⚠️ [HF-SYNC] Warning: Hugging Face repo specified but no HF_TOKEN found. Cloud upload disabled.")
+        return None
+
+    try:
+        api = HfApi(token=token)
+        create_repo(repo_id=repo_id, repo_type="model", token=token, exist_ok=True, private=True)
+        print(f">>> [HF-SYNC] Cloud repository ready: https://huggingface.co/{repo_id} (Private)")
+        return api
+    except Exception as e:
+        print(f"⚠️ [HF-SYNC] Failed to initialize HF repo '{repo_id}': {e}")
+        return None
+
+
+def pull_file_from_hf(
+    repo_id: Optional[str],
+    filename_in_repo: str,
+    local_target_path: str,
+    token: Optional[str] = None
+) -> bool:
+    """Pulls a single checkpoint or result file from Hugging Face Hub if available."""
+    if not repo_id:
+        return False
+    token = token or os.environ.get("HF_TOKEN")
+    try:
+        os.makedirs(os.path.dirname(local_target_path), exist_ok=True)
+        downloaded = hf_hub_download(
+            repo_id=repo_id,
+            filename=filename_in_repo,
+            repo_type="model",
+            token=token,
+            local_dir=os.path.dirname(local_target_path)
+        )
+        print(f">>> [HF-SYNC] Successfully pulled '{filename_in_repo}' from Hugging Face Hub.")
+        return True
+    except Exception:
+        # File doesn't exist yet on remote repo (e.g. fresh run)
+        return False
+
+
+def push_file_to_hf(
+    api: Optional[HfApi],
+    repo_id: Optional[str],
+    local_path: str,
+    path_in_repo: str,
+    token: Optional[str] = None
+):
+    """Pushes a local file to Hugging Face Hub."""
+    if not api or not repo_id or not os.path.isfile(local_path):
+        return
+    token = token or os.environ.get("HF_TOKEN")
+    try:
+        api.upload_file(
+            path_or_fileobj=local_path,
+            path_in_repo=path_in_repo,
+            repo_id=repo_id,
+            repo_type="model",
+            token=token
+        )
+        print(f">>> [HF-SYNC] Uploaded '{path_in_repo}' to Hugging Face Hub.")
+    except Exception as e:
+        print(f"⚠️ [HF-SYNC] Upload failed for '{path_in_repo}': {e}")
+
+
+# ==============================================================================
+# Checkpointing & Auto-Resume Logic
+# ==============================================================================
+
 def get_checkpoint_dir(base_dir: str, model_type: str, k_shots: int, seed: int) -> str:
     path = os.path.join(base_dir, f"{model_type}_k{k_shots}_seed{seed}")
     os.makedirs(path, exist_ok=True)
@@ -51,22 +130,65 @@ def get_checkpoint_dir(base_dir: str, model_type: str, k_shots: int, seed: int) 
 def save_checkpoint(
     state: Dict[str, Any],
     is_best: bool,
-    checkpoint_dir: str
+    checkpoint_dir: str,
+    hf_api: Optional[HfApi] = None,
+    hf_repo: Optional[str] = None,
+    hf_token: Optional[str] = None,
+    exp_subpath: Optional[str] = None
 ):
     latest_path = os.path.join(checkpoint_dir, "checkpoint_latest.pth")
     torch.save(state, latest_path)
+
+    best_path = None
     if is_best:
         best_path = os.path.join(checkpoint_dir, "checkpoint_best.pth")
         torch.save(state, best_path)
+
+    # Cloud sync to Hugging Face Hub
+    if hf_api and hf_repo and exp_subpath:
+        push_file_to_hf(
+            hf_api, hf_repo,
+            local_path=latest_path,
+            path_in_repo=f"checkpoints/{exp_subpath}/checkpoint_latest.pth",
+            token=hf_token
+        )
+        if is_best and best_path:
+            push_file_to_hf(
+                hf_api, hf_repo,
+                local_path=best_path,
+                path_in_repo=f"checkpoints/{exp_subpath}/checkpoint_best.pth",
+                token=hf_token
+            )
 
 
 def load_checkpoint_if_exists(
     checkpoint_dir: str,
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
-    device: str = "cpu"
+    device: str = "cpu",
+    hf_repo: Optional[str] = None,
+    hf_token: Optional[str] = None,
+    exp_subpath: Optional[str] = None
 ) -> Tuple[int, float, List[float]]:
     latest_path = os.path.join(checkpoint_dir, "checkpoint_latest.pth")
+
+    # If local file missing, attempt to pull from Hugging Face Hub
+    if not os.path.isfile(latest_path) and hf_repo and exp_subpath:
+        pull_file_from_hf(
+            repo_id=hf_repo,
+            filename_in_repo=f"checkpoints/{exp_subpath}/checkpoint_latest.pth",
+            local_target_path=latest_path,
+            token=hf_token
+        )
+        # Also pull best checkpoint if available
+        best_path = os.path.join(checkpoint_dir, "checkpoint_best.pth")
+        pull_file_from_hf(
+            repo_id=hf_repo,
+            filename_in_repo=f"checkpoints/{exp_subpath}/checkpoint_best.pth",
+            local_target_path=best_path,
+            token=hf_token
+        )
+
     if not os.path.isfile(latest_path):
         return 1, float("inf"), []
 
@@ -90,7 +212,11 @@ def train_fewshot_adaptation(
     lr: float = 1e-4,
     weight_decay: float = 1e-5,
     device: str = "cpu",
-    checkpoint_dir: Optional[str] = None
+    checkpoint_dir: Optional[str] = None,
+    hf_api: Optional[HfApi] = None,
+    hf_repo: Optional[str] = None,
+    hf_token: Optional[str] = None,
+    exp_subpath: Optional[str] = None
 ) -> List[float]:
     model.train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -102,7 +228,8 @@ def train_fewshot_adaptation(
 
     if checkpoint_dir:
         start_epoch, best_loss, loss_history = load_checkpoint_if_exists(
-            checkpoint_dir, model, optimizer, device=device
+            checkpoint_dir, model, optimizer, device=device,
+            hf_repo=hf_repo, hf_token=hf_token, exp_subpath=exp_subpath
         )
 
     if start_epoch > num_epochs:
@@ -142,7 +269,7 @@ def train_fewshot_adaptation(
 
         print(f"Epoch [{epoch:02d}/{num_epochs:02d}] Loss: {avg_loss:.4f} {'[BEST]' if is_best else ''} (Time: {time.time()-t_epoch:.1f}s)")
 
-        # Save checkpoint after every epoch
+        # Save checkpoint locally and upload to Hugging Face Hub
         if checkpoint_dir:
             state = {
                 "epoch": epoch,
@@ -151,7 +278,15 @@ def train_fewshot_adaptation(
                 "best_loss": best_loss,
                 "loss_history": loss_history
             }
-            save_checkpoint(state, is_best=is_best, checkpoint_dir=checkpoint_dir)
+            save_checkpoint(
+                state,
+                is_best=is_best,
+                checkpoint_dir=checkpoint_dir,
+                hf_api=hf_api,
+                hf_repo=hf_repo,
+                hf_token=hf_token,
+                exp_subpath=exp_subpath
+            )
 
     # Load best model weights for subsequent evaluation
     if checkpoint_dir:
@@ -209,7 +344,10 @@ def evaluate_target_domain(
 def update_results_cache(
     results_dir: str,
     exp_key: str,
-    exp_data: Dict[str, Any]
+    exp_data: Dict[str, Any],
+    hf_api: Optional[HfApi] = None,
+    hf_repo: Optional[str] = None,
+    hf_token: Optional[str] = None
 ):
     os.makedirs(results_dir, exist_ok=True)
     json_path = os.path.join(results_dir, "benchmark_summary.json")
@@ -257,9 +395,29 @@ def update_results_cache(
 
     print(f"\n>>> [SAVED] Benchmark results cached to {json_path} & {csv_path}")
 
+    # Push updated results to Hugging Face Hub
+    if hf_api and hf_repo:
+        push_file_to_hf(hf_api, hf_repo, local_path=json_path, path_in_repo="results/benchmark_summary.json", token=hf_token)
+        push_file_to_hf(hf_api, hf_repo, local_path=csv_path, path_in_repo="results/benchmark_summary.csv", token=hf_token)
 
-def is_experiment_already_done(results_dir: str, exp_key: str) -> Optional[Dict[str, Any]]:
+
+def is_experiment_already_done(
+    results_dir: str,
+    exp_key: str,
+    hf_repo: Optional[str] = None,
+    hf_token: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
     json_path = os.path.join(results_dir, "benchmark_summary.json")
+
+    # If local cache missing, check Hugging Face Hub
+    if not os.path.isfile(json_path) and hf_repo:
+        pull_file_from_hf(
+            repo_id=hf_repo,
+            filename_in_repo="results/benchmark_summary.json",
+            local_target_path=json_path,
+            token=hf_token
+        )
+
     if os.path.isfile(json_path):
         try:
             with open(json_path, "r") as f:
@@ -279,19 +437,27 @@ def run_experiment(
     eval_cases: int = 10,
     checkpoint_base_dir: str = "checkpoints",
     results_dir: str = "results",
+    hf_repo: Optional[str] = None,
+    hf_token: Optional[str] = None,
     force_rerun: bool = False
 ) -> Dict[str, Any]:
     set_seed(seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     exp_key = f"{model_type}_k{k_shots}_seed{seed}_ep{num_epochs}"
+    exp_subpath = f"{model_type}_k{k_shots}_seed{seed}"
 
     print("=" * 80)
     print(f" EXPERIMENT: {model_type.upper()} | {k_shots}-SHOT ADAPTATION | SEED: {seed} | DEVICE: {device}")
+    if hf_repo:
+        print(f" HF CLOUD SYNC: https://huggingface.co/{hf_repo}")
     print("=" * 80)
+
+    # Initialize Hugging Face API connection if specified
+    hf_api = init_hf_sync(repo_id=hf_repo, token=hf_token)
 
     # Check cache to avoid duplicate runs
     if not force_rerun:
-        cached_result = is_experiment_already_done(results_dir, exp_key)
+        cached_result = is_experiment_already_done(results_dir, exp_key, hf_repo=hf_repo, hf_token=hf_token)
         if cached_result is not None:
             print(f">>> [CACHE HIT] Experiment '{exp_key}' already completed with Mean DSC: {cached_result['overall_mean_dsc']:.2f}%.")
             print(">>> Skipping training and evaluation to save compute time! (Pass --force_rerun to override)\n")
@@ -316,13 +482,17 @@ def run_experiment(
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
 
-    # Train with auto-checkpointing & auto-resume
+    # Train with auto-checkpointing, auto-resume, and Hugging Face Hub cloud sync
     train_fewshot_adaptation(
         model,
         support_loader,
         num_epochs=num_epochs,
         device=device,
-        checkpoint_dir=ckpt_dir
+        checkpoint_dir=ckpt_dir,
+        hf_api=hf_api,
+        hf_repo=hf_repo,
+        hf_token=hf_token,
+        exp_subpath=exp_subpath
     )
 
     # Evaluate
@@ -360,12 +530,19 @@ def run_experiment(
         "per_organ": results
     }
 
-    update_results_cache(results_dir, exp_key, exp_payload)
+    update_results_cache(
+        results_dir=results_dir,
+        exp_key=exp_key,
+        exp_data=exp_payload,
+        hf_api=hf_api,
+        hf_repo=hf_repo,
+        hf_token=hf_token
+    )
     return exp_payload
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Fault-Tolerant Few-Shot Segmentation Runner")
+    parser = argparse.ArgumentParser(description="Fault-Tolerant Few-Shot Segmentation Runner with Hugging Face Sync")
     parser.add_argument("--model", type=str, default="hybrid_swin", choices=["hybrid_swin", "unet3d"])
     parser.add_argument("--shots", type=int, default=5)
     parser.add_argument("--epochs", type=int, default=50)
@@ -373,6 +550,10 @@ if __name__ == "__main__":
     parser.add_argument("--eval_cases", type=int, default=10)
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
     parser.add_argument("--results_dir", type=str, default="results")
+    parser.add_argument("--hf_repo", type=str, default=None,
+                        help="Hugging Face Model Repo ID (e.g. 'username/hybrid-swin-unet-checkpoints')")
+    parser.add_argument("--hf_token", type=str, default=None,
+                        help="Hugging Face Access Token (or set HF_TOKEN env var)")
     parser.add_argument("--force_rerun", action="store_true")
     args = parser.parse_args()
 
@@ -384,5 +565,7 @@ if __name__ == "__main__":
         eval_cases=args.eval_cases,
         checkpoint_base_dir=args.checkpoint_dir,
         results_dir=args.results_dir,
+        hf_repo=args.hf_repo,
+        hf_token=args.hf_token,
         force_rerun=args.force_rerun
     )

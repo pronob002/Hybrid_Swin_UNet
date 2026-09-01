@@ -2,7 +2,8 @@
 train.py
 ========
 Top-level CLI execution entrypoint for Few-Shot Cross-Domain 3D Abdominal Multi-Organ Segmentation.
-Includes automated checkpointing, seamless resume logic, and persistent result caching.
+Includes automated checkpointing, seamless resume logic, persistent result caching,
+and optional Hugging Face Hub cloud auto-sync.
 """
 
 from scripts.train_fewshot import run_experiment
@@ -24,6 +25,10 @@ if __name__ == "__main__":
                         help="Directory to save/load model checkpoints (default: checkpoints)")
     parser.add_argument("--results_dir", type=str, default="results",
                         help="Directory to save persistent summary CSV & JSON (default: results)")
+    parser.add_argument("--hf_repo", type=str, default=None,
+                        help="Hugging Face Model Repo ID (e.g. 'username/hybrid-swin-unet-checkpoints')")
+    parser.add_argument("--hf_token", type=str, default=None,
+                        help="Hugging Face Access Token (or set HF_TOKEN env var)")
     parser.add_argument("--force_rerun", action="store_true",
                         help="Force rerun even if experiment already exists in results cache")
     args = parser.parse_args()
@@ -36,5 +41,7 @@ if __name__ == "__main__":
         eval_cases=args.eval_cases,
         checkpoint_base_dir=args.checkpoint_dir,
         results_dir=args.results_dir,
+        hf_repo=args.hf_repo,
+        hf_token=args.hf_token,
         force_rerun=args.force_rerun
     )
