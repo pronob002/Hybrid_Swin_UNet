@@ -3,7 +3,7 @@ src/data/data_loader.py
 =======================
 Memory-Efficient Data Pipeline for 3D Abdominal Multi-Organ Segmentation.
 Supports On-Demand Hugging Face Streaming, Isotropic Resampling, HU Windowing,
-Taxonomy Harmonization, and 3D Patch Extraction.
+Balanced Multi-Organ Foreground Patch Extraction, and Full-Volume Evaluation.
 """
 
 import os
@@ -84,6 +84,8 @@ def extract_3d_patch(
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """
     Extracts a cubic 3D patch of shape (96, 96, 96).
+    Uses balanced multi-organ foreground sampling so small organs (Pancreas, Gallbladder, Adrenals)
+    are sampled just as frequently as large organs (Liver).
     """
     shape = image.shape
     pad_needed = [max(0, patch_size[i] - shape[i]) for i in range(3)]
@@ -95,21 +97,25 @@ def extract_3d_patch(
             label = np.pad(label, pad_width, mode="constant", constant_values=0)
         shape = image.shape
 
-    max_x = shape[0] - patch_size[0]
-    max_y = shape[1] - patch_size[1]
-    max_z = shape[2] - patch_size[2]
+    max_x = max(0, shape[0] - patch_size[0])
+    max_y = max(0, shape[1] - patch_size[1])
+    max_z = max(0, shape[2] - patch_size[2])
 
     if foreground_bias and label is not None and np.any(label > 0):
-        if random.random() < 0.7:
-            fg_indices = np.argwhere(label > 0)
-            center = fg_indices[random.randint(0, len(fg_indices) - 1)]
+        # 85% probability: center on a specific randomly chosen organ class
+        if random.random() < 0.85:
+            unique_organs = np.unique(label[label > 0])
+            chosen_organ = random.choice(unique_organs)
+            organ_coords = np.argwhere(label == chosen_organ)
+            center = organ_coords[random.randint(0, len(organ_coords) - 1)]
+
             start_x = np.clip(center[0] - patch_size[0] // 2, 0, max_x)
             start_y = np.clip(center[1] - patch_size[1] // 2, 0, max_y)
             start_z = np.clip(center[2] - patch_size[2] // 2, 0, max_z)
         else:
-            start_x = random.randint(0, max_x)
-            start_y = random.randint(0, max_y)
-            start_z = random.randint(0, max_z)
+            start_x = random.randint(0, max_x) if max_x > 0 else 0
+            start_y = random.randint(0, max_y) if max_y > 0 else 0
+            start_z = random.randint(0, max_z) if max_z > 0 else 0
     else:
         start_x = random.randint(0, max_x) if max_x > 0 else 0
         start_y = random.randint(0, max_y) if max_y > 0 else 0
@@ -141,12 +147,14 @@ class CT3DDataset(Dataset):
         case_ids: List[str],
         dataset_type: str = "btcv",
         is_training: bool = True,
-        patch_size: Tuple[int, int, int] = PATCH_SIZE
+        patch_size: Tuple[int, int, int] = PATCH_SIZE,
+        samples_per_volume: int = 8
     ):
         self.case_ids = case_ids
         self.dataset_type = dataset_type.lower()
         self.is_training = is_training
         self.patch_size = patch_size
+        self.samples_per_volume = samples_per_volume if is_training else 1
 
         if self.dataset_type == "amos":
             self.repo_id = "MedOtter/amos22-ct-dataset"
@@ -156,7 +164,7 @@ class CT3DDataset(Dataset):
             raise ValueError(f"Unsupported dataset_type: {dataset_type}")
 
     def __len__(self) -> int:
-        return len(self.case_ids)
+        return len(self.case_ids) * self.samples_per_volume
 
     def _get_file_paths(self, case_id: str) -> Tuple[str, str]:
         if self.dataset_type == "amos":
@@ -170,8 +178,9 @@ class CT3DDataset(Dataset):
         lbl_path = hf_hub_download(repo_id=self.repo_id, filename=lbl_rel, repo_type="dataset")
         return img_path, lbl_path
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        case_id = self.case_ids[idx]
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        case_idx = idx // self.samples_per_volume
+        case_id = self.case_ids[case_idx]
         img_path, lbl_path = self._get_file_paths(case_id)
 
         img_nii = nib.load(img_path)
@@ -185,11 +194,12 @@ class CT3DDataset(Dataset):
             img_data, lbl_data, spacing=spacing, dataset_type=self.dataset_type
         )
 
-        img_patch, lbl_patch = extract_3d_patch(
-            norm_img, harm_lbl, patch_size=self.patch_size, foreground_bias=self.is_training
-        )
-
         if self.is_training:
+            # Training: extract foreground-balanced 3D patch with stochastic augmentation
+            img_patch, lbl_patch = extract_3d_patch(
+                norm_img, harm_lbl, patch_size=self.patch_size, foreground_bias=True
+            )
+
             if random.random() < 0.5:
                 img_patch = np.flip(img_patch, axis=0).copy()
                 lbl_patch = np.flip(lbl_patch, axis=0).copy()
@@ -200,14 +210,23 @@ class CT3DDataset(Dataset):
                 scale_factor = random.uniform(0.9, 1.1)
                 img_patch = img_patch * scale_factor
 
-        tensor_img = torch.from_numpy(img_patch).float().unsqueeze(0)  # (1, D, H, W)
-        tensor_lbl = torch.from_numpy(lbl_patch).long()                # (D, H, W)
+            tensor_img = torch.from_numpy(img_patch).float().unsqueeze(0)  # (1, D, H, W)
+            tensor_lbl = torch.from_numpy(lbl_patch).long()                # (D, H, W)
 
-        return {
-            "image": tensor_img,
-            "label": tensor_lbl,
-            "case_id": case_id
-        }
+            return {
+                "image": tensor_img,
+                "label": tensor_lbl,
+                "case_id": case_id
+            }
+        else:
+            # Evaluation: return full 3D volume for sliding window reconstruction
+            tensor_img = torch.from_numpy(norm_img).float().unsqueeze(0)  # (1, D, H, W)
+            return {
+                "image": tensor_img,
+                "label": harm_lbl,
+                "case_id": case_id,
+                "spacing": spacing
+            }
 
 
 def get_btcv_case_ids() -> List[str]:

@@ -1,7 +1,11 @@
 """
 src/utils/losses.py
 ===================
-Compound 3D Multi-Class Dice + Cross-Entropy Loss.
+Compound 3D Multi-Class Dice + Cross-Entropy Loss for 3D Multi-Organ Segmentation.
+
+Optimized for 3D patch-based volumetric training:
+- Computes Soft Dice Loss over classes present in the current 3D patch.
+- Combines with Cross-Entropy Loss for robust voxel-level background and multi-class supervision.
 """
 
 import torch
@@ -28,8 +32,10 @@ class DiceCELoss3D(nn.Module):
         self.ce = nn.CrossEntropyLoss()
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # 1. Standard Cross-Entropy Loss
         ce_loss = self.ce(logits, targets)
 
+        # 2. Multi-Class Soft Dice Loss over present classes
         probs = F.softmax(logits, dim=1)
         targets_one_hot = F.one_hot(targets, num_classes=self.num_classes)
         targets_one_hot = targets_one_hot.permute(0, 4, 1, 2, 3).contiguous().float()
@@ -40,11 +46,17 @@ class DiceCELoss3D(nn.Module):
             p_c = probs[:, c].reshape(probs.shape[0], -1)
             t_c = targets_one_hot[:, c].reshape(targets.shape[0], -1)
 
-            intersection = torch.sum(p_c * t_c, dim=1)
-            cardinality = torch.sum(p_c, dim=1) + torch.sum(t_c, dim=1)
-            dice_c = (2.0 * intersection + self.smooth) / (cardinality + self.smooth)
-            dice_scores.append(dice_c)
+            # Only compute Dice loss for classes present in the target mask
+            if t_c.sum() > 0:
+                intersection = torch.sum(p_c * t_c, dim=1)
+                cardinality = torch.sum(p_c, dim=1) + torch.sum(t_c, dim=1)
+                dice_c = (2.0 * intersection + self.smooth) / (cardinality + self.smooth)
+                dice_scores.append(dice_c)
 
-        dice_loss = 1.0 - torch.mean(torch.stack(dice_scores, dim=0))
+        if len(dice_scores) > 0:
+            dice_loss = 1.0 - torch.mean(torch.cat(dice_scores, dim=0))
+        else:
+            dice_loss = torch.tensor(0.0, device=logits.device)
+
         total_loss = self.lambda_dice * dice_loss + (1.0 - self.lambda_dice) * ce_loss
         return total_loss

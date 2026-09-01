@@ -5,9 +5,12 @@ Fault-Tolerant Few-Shot Cross-Domain Adaptation & Benchmark Evaluation Pipeline.
 
 Key Features:
 1. Automated Per-Epoch Checkpointing (checkpoint_latest.pth & checkpoint_best.pth).
-2. Comprehensive Downstream Artifacts: Saves benchmark_summary.csv, benchmark_summary.json,
+2. Full-Volume 3D Sliding-Window Evaluation: Reconstructs entire 3D patient volumes
+   with 50% overlap for clinically standard Dice and HD95 metric computation.
+3. Multi-Organ Balanced Training: Dynamically centers crops on all 13 anatomical classes.
+4. Comprehensive Downstream Artifacts: Saves benchmark_summary.csv, benchmark_summary.json,
    per_case_details.json (for Wilcoxon p-value statistical tests), and training_curves.json.
-3. Hugging Face Hub Auto-Sync: Automatically pushes all checkpoints & result artifacts to
+5. Hugging Face Hub Auto-Sync: Automatically pushes all checkpoints & result artifacts to
    your private Hugging Face repository for seamless multi-session resume and analysis.
 """
 
@@ -21,6 +24,7 @@ import random
 from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from huggingface_hub import HfApi, hf_hub_download, create_repo
 
@@ -203,11 +207,74 @@ def load_checkpoint_if_exists(
     return start_epoch, best_loss, loss_history
 
 
+# ==============================================================================
+# 3D Sliding Window Full-Volume Inference
+# ==============================================================================
+
+def sliding_window_inference_3d(
+    model: torch.nn.Module,
+    volume: torch.Tensor,
+    patch_size: Tuple[int, int, int] = (96, 96, 96),
+    num_classes: int = 14,
+    overlap: float = 0.5,
+    device: str = "cpu"
+) -> torch.Tensor:
+    """
+    Standard 3D sliding window inference across the full volumetric scan.
+    """
+    model.eval()
+    if volume.ndim == 4:
+        volume = volume.unsqueeze(0)  # Ensure (1, 1, D, H, W)
+
+    B, C, D, H, W = volume.shape
+    pD, pH, pW = patch_size
+
+    pad_d = max(0, pD - D)
+    pad_h = max(0, pH - H)
+    pad_w = max(0, pW - W)
+    if pad_d > 0 or pad_h > 0 or pad_w > 0:
+        volume = F.pad(volume, (0, pad_w, 0, pad_h, 0, pad_d), mode="constant", value=0)
+        _, _, D, H, W = volume.shape
+
+    step_d = max(1, int(pD * (1.0 - overlap)))
+    step_h = max(1, int(pH * (1.0 - overlap)))
+    step_w = max(1, int(pW * (1.0 - overlap)))
+
+    d_steps = list(range(0, D - pD + 1, step_d))
+    if len(d_steps) == 0 or d_steps[-1] != D - pD:
+        d_steps.append(max(0, D - pD))
+
+    h_steps = list(range(0, H - pH + 1, step_h))
+    if len(h_steps) == 0 or h_steps[-1] != H - pH:
+        h_steps.append(max(0, H - pH))
+
+    w_steps = list(range(0, W - pW + 1, step_w))
+    if len(w_steps) == 0 or w_steps[-1] != W - pW:
+        w_steps.append(max(0, W - pW))
+
+    output_logits = torch.zeros((1, num_classes, D, H, W), device="cpu")
+    count_map = torch.zeros((1, 1, D, H, W), device="cpu")
+
+    with torch.no_grad():
+        for d in d_steps:
+            for h in h_steps:
+                for w in w_steps:
+                    patch = volume[:, :, d:d+pD, h:h+pH, w:w+pW].to(device)
+                    logits = model(patch).cpu()
+                    output_logits[:, :, d:d+pD, h:h+pH, w:w+pW] += logits
+                    count_map[:, :, d:d+pD, h:h+pH, w:w+pW] += 1.0
+
+    output_logits /= count_map.clamp(min=1.0)
+    if pad_d > 0 or pad_h > 0 or pad_w > 0:
+        output_logits = output_logits[:, :, :D - pad_d, :H - pad_h, :W - pad_w]
+    return output_logits
+
+
 def train_fewshot_adaptation(
     model: torch.nn.Module,
     train_loader: DataLoader,
     num_epochs: int = 50,
-    lr: float = 1e-4,
+    lr: float = 2e-4,
     weight_decay: float = 1e-5,
     device: str = "cpu",
     checkpoint_dir: Optional[str] = None,
@@ -218,6 +285,7 @@ def train_fewshot_adaptation(
 ) -> List[float]:
     model.train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
     criterion = DiceCELoss3D(num_classes=14)
 
     start_epoch = 1
@@ -259,13 +327,15 @@ def train_fewshot_adaptation(
             epoch_loss += loss.item()
             num_batches += 1
 
+        scheduler.step()
         avg_loss = epoch_loss / max(1, num_batches)
         loss_history.append(avg_loss)
         is_best = avg_loss < best_loss
         if is_best:
             best_loss = avg_loss
 
-        print(f"Epoch [{epoch:02d}/{num_epochs:02d}] Loss: {avg_loss:.4f} {'[BEST]' if is_best else ''} (Time: {time.time()-t_epoch:.1f}s)")
+        current_lr = scheduler.get_last_lr()[0]
+        print(f"Epoch [{epoch:02d}/{num_epochs:02d}] Loss: {avg_loss:.4f} {'[BEST]' if is_best else ''} (LR: {current_lr:.2e}, Time: {time.time()-t_epoch:.1f}s)")
 
         # Save checkpoint locally and upload to Hugging Face Hub
         if checkpoint_dir:
@@ -304,24 +374,24 @@ def evaluate_target_domain(
     max_cases: Optional[int] = None
 ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, Dict[str, float]]]]:
     """
-    Evaluates on unseen BTCV cases. Returns:
-    1. Summary dictionary across all cases (Mean/Std DSC, Mean HD95, Mean ASD per organ).
-    2. Detailed per-case dictionary for statistical significance testing (Wilcoxon signed-rank).
+    Evaluates on unseen BTCV cases using full 3D sliding window inference.
     """
     model.eval()
     all_organ_metrics = {name: {"DSC": [], "HD95": [], "ASD": []} for name in list(UNIFIED_ORGAN_NAMES.values())[1:]}
     per_case_details: Dict[str, Dict[str, Dict[str, float]]] = {}
 
-    print("\n--- Evaluating on BTCV Target Domain ---")
+    print("\n--- Evaluating on BTCV Target Domain (3D Sliding Window Full-Volume) ---")
     case_count = 0
     with torch.no_grad():
         for batch in val_loader:
             case_id = batch["case_id"][0]
-            image = batch["image"].to(device)
-            label = batch["label"][0].numpy()
+            image = batch["image"]  # (1, 1, D, H, W)
+            label = batch["label"][0].numpy() if isinstance(batch["label"], torch.Tensor) else batch["label"]
 
-            logits = model(image)
-            preds = torch.argmax(logits, dim=1)[0].cpu().numpy()
+            logits = sliding_window_inference_3d(
+                model, image, patch_size=(96, 96, 96), overlap=0.5, device=device
+            )
+            preds = torch.argmax(logits, dim=1)[0].numpy()
 
             case_res = evaluate_case(preds, label, num_classes=14)
             per_case_details[case_id] = case_res
@@ -501,7 +571,7 @@ def run_experiment(
 
     support_cases = get_amos_fewshot_cases(k=k_shots, seed=seed)
     print(f"Sampled {k_shots} AMOS Support Cases: {support_cases}")
-    support_ds = CT3DDataset(case_ids=support_cases, dataset_type="amos", is_training=True)
+    support_ds = CT3DDataset(case_ids=support_cases, dataset_type="amos", is_training=True, samples_per_volume=8)
     support_loader = DataLoader(support_ds, batch_size=1, shuffle=True)
 
     btcv_cases = get_btcv_case_ids()[:eval_cases]
@@ -521,6 +591,7 @@ def run_experiment(
         model,
         support_loader,
         num_epochs=num_epochs,
+        lr=2e-4,
         device=device,
         checkpoint_dir=ckpt_dir,
         hf_api=hf_api,
@@ -529,7 +600,7 @@ def run_experiment(
         exp_subpath=exp_subpath
     )
 
-    # Evaluate
+    # Evaluate using 3D Sliding-Window Full-Volume Reconstruction
     results, per_case_details = evaluate_target_domain(model, target_loader, device=device, max_cases=eval_cases)
 
     mean_all_dsc = [m["Mean DSC (%)"] for m in results.values()]
