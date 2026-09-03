@@ -54,7 +54,8 @@ Hybrid_Swin_UNet/
 │       └── metrics.py         # Multi-class DSC (%), HD95 (mm), ASD (mm), Gen. Gap
 │
 └── scripts/                   # Standalone execution pipelines
-    └── train_fewshot.py       # Episodic few-shot training & evaluation runner
+    ├── train_fewshot.py       # Episodic few-shot training & evaluation runner
+    └── cleanup_checkpoints.py # Hugging Face Cloud & local storage optimizer
 ```
 
 ---

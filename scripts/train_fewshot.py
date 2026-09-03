@@ -21,6 +21,7 @@ import json
 import csv
 import argparse
 import random
+import shutil
 from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
 import torch
@@ -86,10 +87,10 @@ def pull_file_from_hf(
             repo_id=repo_id,
             filename=filename_in_repo,
             repo_type="model",
-            token=token,
-            local_dir=os.path.dirname(local_target_path)
+            token=token
         )
-        print(f">>> [HF-SYNC] Successfully pulled '{filename_in_repo}' from Hugging Face Hub.")
+        shutil.copyfile(downloaded, local_target_path)
+        print(f">>> [HF-SYNC] Successfully pulled '{filename_in_repo}' -> '{local_target_path}'.")
         return True
     except Exception:
         # File doesn't exist yet on remote repo (e.g. fresh run)
@@ -168,6 +169,7 @@ def load_checkpoint_if_exists(
     checkpoint_dir: str,
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
+    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
     device: str = "cpu",
     hf_repo: Optional[str] = None,
     hf_token: Optional[str] = None,
@@ -192,9 +194,13 @@ def load_checkpoint_if_exists(
         )
 
     if not os.path.isfile(latest_path):
+        print(f"\n{'='*80}")
+        print(f" [RUN STATUS] >>> STARTING TRAINING FROM THE BEGINNING (SCRATCH)")
+        print(f" Prior Checkpoint  : Not found at '{latest_path}'")
+        print(f" Execution Plan    : Fresh adaptation beginning at Epoch 1")
+        print(f"{'='*80}\n")
         return 1, float("inf"), []
 
-    print(f"\n>>> [AUTO-RESUME] Found existing checkpoint: {latest_path}")
     checkpoint = torch.load(latest_path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -202,8 +208,20 @@ def load_checkpoint_if_exists(
     best_loss = checkpoint.get("best_loss", float("inf"))
     loss_history = checkpoint.get("loss_history", [])
 
-    print(f">>> [AUTO-RESUME] Successfully restored state from Epoch {checkpoint['epoch']} (Best Loss: {best_loss:.4f})")
-    print(f">>> [AUTO-RESUME] Resuming training from Epoch {start_epoch}...\n")
+    if scheduler is not None:
+        if "scheduler_state_dict" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        else:
+            for _ in range(1, start_epoch):
+                scheduler.step()
+
+    print(f"\n{'='*80}")
+    print(f" [RUN STATUS] >>> RESUMING TRAINING FROM PREVIOUS CHECKPOINT")
+    print(f" Checkpoint Source : {latest_path}")
+    print(f" Restored Epoch    : {checkpoint['epoch']} (Best Loss: {best_loss:.4f})")
+    print(f" Resuming At Epoch : {start_epoch} (Epochs 1 to {checkpoint['epoch']} already finished)")
+    print(f" Prior Loss History: {len(loss_history)} epochs restored")
+    print(f"{'='*80}\n")
     return start_epoch, best_loss, loss_history
 
 
@@ -294,12 +312,15 @@ def train_fewshot_adaptation(
 
     if checkpoint_dir:
         start_epoch, best_loss, loss_history = load_checkpoint_if_exists(
-            checkpoint_dir, model, optimizer, device=device,
+            checkpoint_dir, model, optimizer, scheduler=scheduler, device=device,
             hf_repo=hf_repo, hf_token=hf_token, exp_subpath=exp_subpath
         )
 
     if start_epoch > num_epochs:
-        print(f">>> [COMPLETED] Model has already completed all {num_epochs} epochs. Skipping training.")
+        print(f"\n{'='*80}")
+        print(f" [RUN STATUS] >>> ALL {num_epochs} EPOCHS ALREADY COMPLETED")
+        print(f" Skipping adaptation loop and proceeding directly to BTCV target evaluation.")
+        print(f"{'='*80}\n")
         if checkpoint_dir:
             best_path = os.path.join(checkpoint_dir, "checkpoint_best.pth")
             if os.path.isfile(best_path):
@@ -308,7 +329,10 @@ def train_fewshot_adaptation(
                 print(f">>> Loaded best checkpoint weights from {best_path}")
         return loss_history
 
-    print(f"\n--- Starting Few-Shot Adaptation (Epochs {start_epoch} -> {num_epochs}) on Device: {device} ---")
+    if start_epoch == 1:
+        print(f"\n--- [TRAINING START] Fresh Run: Training from Scratch (Epochs 1 -> {num_epochs}) on Device: {device} ---")
+    else:
+        print(f"\n--- [TRAINING RESUME] Resuming Adaptation from Checkpoint (Epochs {start_epoch} -> {num_epochs}) on Device: {device} ---")
     for epoch in range(start_epoch, num_epochs + 1):
         epoch_loss = 0.0
         num_batches = 0
@@ -343,6 +367,7 @@ def train_fewshot_adaptation(
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
                 "best_loss": best_loss,
                 "loss_history": loss_history
             }
@@ -645,6 +670,31 @@ def run_experiment(
         hf_repo=hf_repo,
         hf_token=hf_token
     )
+
+    # Automatically purge redundant intermediate checkpoint to save Hugging Face & local storage
+    if hf_api and hf_repo:
+        try:
+            latest_path_in_repo = f"checkpoints/{exp_subpath}/checkpoint_latest.pth"
+            hf_api.delete_file(
+                path_in_repo=latest_path_in_repo,
+                repo_id=hf_repo,
+                repo_type="model",
+                token=hf_token,
+                commit_message=f"Storage Cleanup: Purge intermediate checkpoint for completed {exp_subpath}"
+            )
+            print(f">>> [STORAGE CLEANUP] Auto-purged redundant '{latest_path_in_repo}' from Hugging Face Hub (freed ~33.8 MB).")
+        except Exception:
+            pass
+
+    # Also clean local intermediate checkpoint
+    local_latest = os.path.join(ckpt_dir, "checkpoint_latest.pth")
+    if os.path.isfile(local_latest) and os.path.isfile(os.path.join(ckpt_dir, "checkpoint_best.pth")):
+        try:
+            os.remove(local_latest)
+            print(f">>> [STORAGE CLEANUP] Auto-purged local redundant '{local_latest}'.")
+        except Exception:
+            pass
+
     return exp_payload
 
 
