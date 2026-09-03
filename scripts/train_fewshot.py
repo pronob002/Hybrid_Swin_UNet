@@ -361,7 +361,7 @@ def train_fewshot_adaptation(
         current_lr = scheduler.get_last_lr()[0]
         print(f"Epoch [{epoch:02d}/{num_epochs:02d}] Loss: {avg_loss:.4f} {'[BEST]' if is_best else ''} (LR: {current_lr:.2e}, Time: {time.time()-t_epoch:.1f}s)")
 
-        # Save checkpoint locally and upload to Hugging Face Hub
+        # Save checkpoint locally every epoch; sync to Hugging Face on milestones (best, every 5 epochs, final)
         if checkpoint_dir:
             state = {
                 "epoch": epoch,
@@ -371,13 +371,14 @@ def train_fewshot_adaptation(
                 "best_loss": best_loss,
                 "loss_history": loss_history
             }
+            sync_to_hf = is_best or (epoch % 5 == 0) or (epoch == num_epochs)
             save_checkpoint(
                 state,
                 is_best=is_best,
                 checkpoint_dir=checkpoint_dir,
-                hf_api=hf_api,
-                hf_repo=hf_repo,
-                hf_token=hf_token,
+                hf_api=hf_api if sync_to_hf else None,
+                hf_repo=hf_repo if sync_to_hf else None,
+                hf_token=hf_token if sync_to_hf else None,
                 exp_subpath=exp_subpath
             )
 
